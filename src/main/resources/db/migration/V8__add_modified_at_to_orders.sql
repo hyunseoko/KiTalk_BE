@@ -1,2 +1,0 @@
-ALTER TABLE orders
-    ADD COLUMN modified_at DATETIME NULL DEFAULT NULL;
