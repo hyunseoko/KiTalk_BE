@@ -11,6 +11,9 @@ import org.springframework.security.web.SecurityFilterChain;
 public class SecurityConfig {
 
   private static final String[] SWAGGER_WHITELIST = {
+      "/api/docs",
+      "/api/docs/**",
+      "/api/swagger-ui/**",
       "/swagger-ui.html",
       "/swagger-ui/**",
       "/v3/api-docs/**",
@@ -25,9 +28,9 @@ public class SecurityConfig {
         .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
         .authorizeHttpRequests(auth -> auth
             .requestMatchers(SWAGGER_WHITELIST).permitAll()
-            .requestMatchers("/auth/**", "/health", "/actuator/**").permitAll()
-                .anyRequest().permitAll()
-//            .anyRequest().authenticated()
+            .requestMatchers("/auth/**", "/health", "/actuator/**", "/error").permitAll()
+            .requestMatchers("/api/menu/**", "/api/touch/**", "/api/phone/**").permitAll()
+            .anyRequest().denyAll()
         );
     return http.build();
   }

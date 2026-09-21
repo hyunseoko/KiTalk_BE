@@ -2,11 +2,21 @@ package likelion.kitalk.touch.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import likelion.kitalk.global.exception.CustomException;
+import likelion.kitalk.touch.dto.CartData;
+import likelion.kitalk.touch.dto.CartEntry;
 import likelion.kitalk.touch.dto.request.CartAddRequest;
 import likelion.kitalk.touch.dto.request.CartRemoveRequest;
 import likelion.kitalk.touch.dto.request.CartUpdateRequest;
 import likelion.kitalk.touch.dto.request.PackagingRequest;
+import likelion.kitalk.touch.dto.response.CartResponse;
 import likelion.kitalk.touch.exception.CartErrorCode;
 import likelion.kitalk.touch.util.CartUtils;
 import likelion.kitalk.touch.validator.CartValidator;
@@ -15,364 +25,215 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class CartService {
+  private static final String CART_KEY_PREFIX = "touch_cart:";
+  private static final String PACKAGING_KEY_PREFIX = "touch_packaging:";
+  private static final long CART_EXPIRE_HOURS = 2;
 
   private final RedisTemplate<String, String> redisTemplate;
   private final ObjectMapper objectMapper;
   private final CartValidator cartValidator;
   private final CartUtils cartUtils;
 
-  private static final String CART_KEY_PREFIX = "touch_cart:";
-  private static final String PACKAGING_KEY_PREFIX = "touch_packaging:";  // 포장 방식 키 prefix
-  private static final long CART_EXPIRE_HOURS = 2;
-
-  // 장바구니에 메뉴 추가
   public Map<String, Object> addToCart(String sessionId, CartAddRequest request) {
-    log.info("장바구니 담기 - sessionId: {}, menuId: {}, quantity: {}",
-        sessionId, request.getMenuId(), request.getQuantity());
-
     cartValidator.validateAddRequest(sessionId, request);
-
     try {
-      Map<String, Object> cartData = getCartData(sessionId);
-
-      @SuppressWarnings("unchecked")
-      List<Map<String, Object>> items = (List<Map<String, Object>>) cartData.get("items");
-
-      // 동일한 메뉴가 있는지 확인
-      Map<String, Object> existingItem = cartUtils.findCartItem(items, request.getMenuId());
-
-      if (existingItem != null) {
-        // 기존 항목 수량 증가
-        Integer currentQuantity = (Integer) existingItem.get("quantity");
-        Integer newQuantity = currentQuantity + request.getQuantity();
-        existingItem.put("quantity", newQuantity);
-        log.debug("기존 메뉴 수량 증가 - menuId: {}, {} → {}",
-            request.getMenuId(), currentQuantity, newQuantity);
+      CartData cart = getCartData(sessionId);
+      CartEntry existing = cart.getItems().stream()
+          .filter(item -> item.getMenuId().equals(request.getMenuId()))
+          .findFirst().orElse(null);
+      if (existing == null) {
+        cart.getItems().add(new CartEntry(request.getMenuId(), request.getQuantity()));
       } else {
-        // 새 항목 추가
-        Map<String, Object> newItem = new HashMap<>();
-        newItem.put("menuId", request.getMenuId());
-        newItem.put("quantity", request.getQuantity());
-        items.add(newItem);
-        log.debug("새 메뉴 추가 - menuId: {}, quantity: {}",
-            request.getMenuId(), request.getQuantity());
+        existing.setQuantity(Math.addExact(existing.getQuantity(), request.getQuantity()));
       }
-
-      saveCartData(sessionId, cartData);
-
-      log.info("장바구니 담기 완료 - sessionId: {}, 총 항목 수: {}",
-          sessionId, items.size());
-
-      return cartUtils.convertToMap(
-          createCartResponseWithPackaging("장바구니에 담겼습니다", cartData, sessionId)
-      );
-
+      saveCartData(sessionId, cart);
+      return response("장바구니에 담겼습니다", cart, sessionId);
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("장바구니 담기 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("장바구니 담기 실패", e);
       throw new CustomException(CartErrorCode.CART_UPDATE_FAILED);
     }
   }
 
-  // 장바구니 전체 업데이트
   public Map<String, Object> updateCart(String sessionId, CartUpdateRequest request) {
-    log.info("장바구니 업데이트 - sessionId: {}, 요청 항목 수: {}",
-        sessionId, request.getOrders().size());
-
     cartValidator.validateUpdateRequest(sessionId, request);
-
     try {
-      Map<String, Object> cartData = getCartData(sessionId);
-
-      @SuppressWarnings("unchecked")
-      List<Map<String, Object>> currentItems = (List<Map<String, Object>>) cartData.get("items");
-
-      // 현재 장바구니를 Map으로 변환 (효율적인 조회를 위해)
-      Map<Long, Map<String, Object>> currentItemsMap = new HashMap<>();
-      for (Map<String, Object> item : currentItems) {
-        Long menuId = ((Number) item.get("menuId")).longValue();
-        currentItemsMap.put(menuId, item);
+      CartData cart = getCartData(sessionId);
+      Map<Long, Integer> requested = new HashMap<>();
+      for (CartUpdateRequest.CartUpdateItem item : request.getOrders()) {
+        requested.put(item.getMenu_id(), item.getQuantity());
       }
-
-      // 요청된 항목들을 Map으로 변환
-      Map<Long, Integer> requestItemsMap = new HashMap<>();
-      for (CartUpdateRequest.CartUpdateItem requestItem : request.getOrders()) {
-        Long menuId = requestItem.getMenu_id();
-        Integer quantity = requestItem.getQuantity();
-        requestItemsMap.put(menuId, quantity);
-      }
-
-      int addedCount = 0, updatedCount = 0, removedCount = 0;
-
-      // 1. 요청된 항목들 처리 (추가 또는 수량 변경)
-      for (Map.Entry<Long, Integer> entry : requestItemsMap.entrySet()) {
-        Long menuId = entry.getKey();
-        Integer newQuantity = entry.getValue();
-
-        if (newQuantity <= 0) {
-          // 수량이 0 이하면 제거
-          if (currentItemsMap.containsKey(menuId)) {
-            currentItems.removeIf(item -> ((Number) item.get("menuId")).longValue() == menuId);
-            removedCount++;
-            log.debug("메뉴 제거 - menuId: {}", menuId);
-          }
-        } else {
-          Map<String, Object> existingItem = currentItemsMap.get(menuId);
-          if (existingItem != null) {
-            // 기존 항목 수량 변경
-            Integer oldQuantity = (Integer) existingItem.get("quantity");
-            if (!oldQuantity.equals(newQuantity)) {
-              existingItem.put("quantity", newQuantity);
-              updatedCount++;
-              log.debug("메뉴 수량 변경 - menuId: {}, {} → {}",
-                  menuId, oldQuantity, newQuantity);
-            }
-          } else {
-            // 새 항목 추가
-            Map<String, Object> newItem = new HashMap<>();
-            newItem.put("menuId", menuId);
-            newItem.put("quantity", newQuantity);
-            currentItems.add(newItem);
-            addedCount++;
-            log.debug("새 메뉴 추가 - menuId: {}, 수량: {}", menuId, newQuantity);
-          }
+      int before = cart.getItems().size();
+      cart.getItems().removeIf(item -> !requested.containsKey(item.getMenuId())
+          || requested.get(item.getMenuId()) == 0);
+      int removed = before - cart.getItems().size();
+      int added = 0;
+      int updated = 0;
+      for (Map.Entry<Long, Integer> item : requested.entrySet()) {
+        if (item.getValue() == 0) {
+          continue;
+        }
+        CartEntry existing = cart.getItems().stream()
+            .filter(entry -> entry.getMenuId().equals(item.getKey()))
+            .findFirst().orElse(null);
+        if (existing == null) {
+          cart.getItems().add(new CartEntry(item.getKey(), item.getValue()));
+          added++;
+        } else if (!existing.getQuantity().equals(item.getValue())) {
+          existing.setQuantity(item.getValue());
+          updated++;
         }
       }
-
-      // 2. 요청에 없는 기존 항목들 제거
-      Iterator<Map<String, Object>> iterator = currentItems.iterator();
-      while (iterator.hasNext()) {
-        Map<String, Object> item = iterator.next();
-        Long menuId = ((Number) item.get("menuId")).longValue();
-        if (!requestItemsMap.containsKey(menuId)) {
-          iterator.remove();
-          removedCount++;
-          log.debug("요청에 없는 메뉴 제거 - menuId: {}", menuId);
-        }
-      }
-
-      saveCartData(sessionId, cartData);
-
-      log.info("장바구니 업데이트 완료 - sessionId: {}, 추가: {}, 변경: {}, 제거: {}, 총 항목: {}",
-          sessionId, addedCount, updatedCount, removedCount, currentItems.size());
-
-      String message = String.format("장바구니가 업데이트되었습니다 (추가: %d, 변경: %d, 제거: %d)",
-          addedCount, updatedCount, removedCount);
-
-      return cartUtils.convertToMap(
-          createCartResponseWithPackaging(message, cartData, sessionId)
-      );
-
+      saveCartData(sessionId, cart);
+      return response(String.format("장바구니가 업데이트되었습니다 (추가: %d, 변경: %d, 제거: %d)",
+          added, updated, removed), cart, sessionId);
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("장바구니 업데이트 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("장바구니 업데이트 실패", e);
       throw new CustomException(CartErrorCode.CART_UPDATE_FAILED);
     }
   }
 
-  // 특정 메뉴 삭제
   public Map<String, Object> removeMenuItem(String sessionId, CartRemoveRequest request) {
-    log.info("특정 메뉴 삭제 - sessionId: {}, menuId: {}",
-        sessionId, request.getMenuId());
-
     cartValidator.validateRemoveRequest(sessionId, request);
-
     try {
-      Map<String, Object> cartData = getCartData(sessionId);
-
-      @SuppressWarnings("unchecked")
-      List<Map<String, Object>> items = (List<Map<String, Object>>) cartData.get("items");
-
-      // 해당 메뉴 찾기 및 제거
-      boolean removed = items.removeIf(item ->
-          ((Number) item.get("menuId")).longValue() == request.getMenuId());
-
+      CartData cart = getCartData(sessionId);
+      boolean removed = cart.getItems().removeIf(
+          item -> item.getMenuId().equals(request.getMenuId()));
       if (!removed) {
         throw new CustomException(CartErrorCode.CART_ITEM_NOT_FOUND);
       }
-
-      saveCartData(sessionId, cartData);
-
-      log.info("특정 메뉴 삭제 완료 - sessionId: {}, menuId: {}, 남은 항목 수: {}",
-          sessionId, request.getMenuId(), items.size());
-
-      return cartUtils.convertToMap(
-          createCartResponseWithPackaging("메뉴가 삭제되었습니다", cartData, sessionId)
-      );
-
+      saveCartData(sessionId, cart);
+      return response("메뉴가 삭제되었습니다", cart, sessionId);
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("특정 메뉴 삭제 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("장바구니 메뉴 삭제 실패", e);
       throw new CustomException(CartErrorCode.CART_UPDATE_FAILED);
     }
   }
 
-  // 장바구니 전체 비우기
   public Map<String, Object> clearCart(String sessionId) {
-    log.info("장바구니 전체 비우기 - sessionId: {}", sessionId);
-
     cartValidator.validateSessionOnly(sessionId);
-
     try {
-      String cartKey = CART_KEY_PREFIX + sessionId;
-      redisTemplate.delete(cartKey);
-
-      Map<String, Object> emptyCart = cartUtils.createEmptyCart();
-
-      log.info("장바구니 비우기 완료 - sessionId: {}", sessionId);
-
-      return cartUtils.convertToMap(
-          createCartResponseWithPackaging("장바구니가 비워졌습니다", emptyCart, sessionId)
-      );
-
+      redisTemplate.delete(CART_KEY_PREFIX + sessionId);
+      return response("장바구니가 비워졌습니다", emptyCart(), sessionId);
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("장바구니 비우기 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("장바구니 비우기 실패", e);
       throw new CustomException(CartErrorCode.CART_CLEAR_FAILED);
     }
   }
 
-  // 장바구니 조회
   public Map<String, Object> getCart(String sessionId) {
-    log.info("장바구니 조회 - sessionId: {}", sessionId);
-
     cartValidator.validateSessionOnly(sessionId);
-
     try {
-      Map<String, Object> cartData = getCartData(sessionId);
-
-      @SuppressWarnings("unchecked")
-      List<Map<String, Object>> items = (List<Map<String, Object>>) cartData.get("items");
-
-      log.info("장바구니 조회 완료 - sessionId: {}, 항목 수: {}", sessionId, items.size());
-
-      return cartUtils.convertToMap(
-          createCartResponseWithPackaging("장바구니 조회 성공", cartData, sessionId)
-      );
-
+      return response("장바구니 조회 성공", getCartData(sessionId), sessionId);
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("장바구니 조회 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("장바구니 조회 실패", e);
       throw new CustomException(CartErrorCode.CART_FETCH_FAILED);
     }
   }
 
-  // 포장 방식 설정
   public Map<String, Object> setPackagingType(String sessionId, PackagingRequest request) {
-    log.info("포장 방식 설정 - sessionId: {}, packagingType: {}",
-        sessionId, request.getPackagingType());
-
     cartValidator.validatePackagingRequest(sessionId, request);
-
     try {
-      // 별도 키로 포장 방식 저장
-      String packagingKey = PACKAGING_KEY_PREFIX + sessionId;
-      Map<String, Object> packagingData = new HashMap<>();
-      packagingData.put("packagingType", request.getPackagingType());
-      packagingData.put("updatedAt", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-
-      String packagingJson = objectMapper.writeValueAsString(packagingData);
-      redisTemplate.opsForValue().set(packagingKey, packagingJson, CART_EXPIRE_HOURS, TimeUnit.HOURS);
-
-      log.info("포장 방식 설정 완료 - sessionId: {}, packagingType: {}",
-          sessionId, request.getPackagingType());
-
-      return cartUtils.convertToMap(
-          cartUtils.createPackagingResponse("포장 방식이 설정되었습니다",
-              sessionId,
-              request.getPackagingType())
-      );
-
+      Map<String, Object> packaging = new HashMap<>();
+      packaging.put("packagingType", request.getPackagingType());
+      packaging.put("updatedAt", now());
+      redisTemplate.opsForValue().set(PACKAGING_KEY_PREFIX + sessionId,
+          objectMapper.writeValueAsString(packaging), CART_EXPIRE_HOURS, TimeUnit.HOURS);
+      return cartUtils.convertToMap(cartUtils.createPackagingResponse(
+          "포장 방식이 설정되었습니다", sessionId, request.getPackagingType()));
+    } catch (CustomException e) {
+      throw e;
     } catch (Exception e) {
-      log.error("포장 방식 설정 중 오류 발생 - sessionId: {}", sessionId, e);
+      log.error("포장 방식 설정 실패", e);
       throw new CustomException(CartErrorCode.PACKAGING_UPDATE_FAILED);
     }
   }
 
-
-  // 포장 방식을 포함한 CartResponse 생성
-  private likelion.kitalk.touch.dto.response.CartResponse createCartResponseWithPackaging(
-      String message, Map<String, Object> cartData, String sessionId) {
-    
-    @SuppressWarnings("unchecked")
-    List<Map<String, Object>> items = (List<Map<String, Object>>) cartData.get("items");
-
-    // Redis 아이템을 CartItemDetail로 변환
-    var orders = cartUtils.convertToCartItemDetails(items);
-    
-    // 총 가격 계산
-    int totalPrice = cartUtils.calculateTotalPrice(items);
-    
-    // 포장 방식 조회
-    String packaging = getPackagingType(sessionId);
-    
-    return likelion.kitalk.touch.dto.response.CartResponse.builder()
-            .message(message)
-            .orders(orders)
-            .total_items(orders.size())
-            .total_price(totalPrice)
-            .packaging(packaging)
-            .session_id(sessionId)
-            .build();
-  }
-
-  // Redis에서 포장 방식 조회
-  private String getPackagingType(String sessionId) {
-    try {
-      String packagingKey = PACKAGING_KEY_PREFIX + sessionId;
-      String packagingJson = redisTemplate.opsForValue().get(packagingKey);
-      
-      if (packagingJson == null) {
-        return null;  // 설정되지 않았으면 null 반환
-      }
-      
-      @SuppressWarnings("unchecked")
-      Map<String, Object> packagingData = objectMapper.readValue(packagingJson, Map.class);
-      return (String) packagingData.get("packagingType");
-      
-    } catch (Exception e) {
-      log.warn("포장 방식 조회 실패 - sessionId: {}, null 반환", sessionId, e);
-      return null;  // 오류시 null 반환
+  private Map<String, Object> response(String message, CartData cart, String sessionId) {
+    // PhoneService still consumes the shared Redis JSON as maps.
+    List<Map<String, Object>> items = new ArrayList<>();
+    for (CartEntry entry : cart.getItems()) {
+      Map<String, Object> item = new HashMap<>();
+      item.put("menuId", entry.getMenuId());
+      item.put("quantity", entry.getQuantity());
+      items.add(item);
     }
+    var orders = cartUtils.convertToCartItemDetails(items);
+    CartResponse result = CartResponse.builder()
+        .message(message)
+        .orders(orders)
+        .total_items(orders.size())
+        .total_price(cartUtils.calculateTotalPrice(items))
+        .packaging(getPackagingType(sessionId))
+        .session_id(sessionId)
+        .build();
+    return cartUtils.convertToMap(result);
   }
 
-  // Redis에서 장바구니 데이터 조회
-  @SuppressWarnings("unchecked")
-  private Map<String, Object> getCartData(String sessionId) {
+  private String getPackagingType(String sessionId) {
+    String json = redisTemplate.opsForValue().get(PACKAGING_KEY_PREFIX + sessionId);
+    if (json == null) {
+      return null;
+    }
     try {
-      String cartKey = CART_KEY_PREFIX + sessionId;
-      String cartJson = redisTemplate.opsForValue().get(cartKey);
-
-      if (cartJson == null) {
-        return cartUtils.createEmptyCart();
-      }
-
-      return objectMapper.readValue(cartJson, Map.class);
-
+      @SuppressWarnings("unchecked")
+      Map<String, Object> data = objectMapper.readValue(json, Map.class);
+      return (String) data.get("packagingType");
     } catch (JsonProcessingException e) {
-      log.error("장바구니 데이터 파싱 실패 - sessionId: {}", sessionId, e);
+      log.error("포장 방식 데이터 파싱 실패", e);
       throw new CustomException(CartErrorCode.CART_DATA_CORRUPTED);
     }
   }
 
-  // Redis에 장바구니 데이터 저장
-  private void saveCartData(String sessionId, Map<String, Object> cartData) {
+  private CartData getCartData(String sessionId) {
+    String json = redisTemplate.opsForValue().get(CART_KEY_PREFIX + sessionId);
+    if (json == null) {
+      return emptyCart();
+    }
     try {
-      // 업데이트 시간 갱신
-      cartData.put("updatedAt", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-
-      String cartKey = CART_KEY_PREFIX + sessionId;
-      String cartJson = objectMapper.writeValueAsString(cartData);
-
-      redisTemplate.opsForValue().set(cartKey, cartJson, CART_EXPIRE_HOURS, TimeUnit.HOURS);
-
+      CartData cart = objectMapper.readValue(json, CartData.class);
+      if (cart == null || cart.getItems() == null) {
+        throw new CustomException(CartErrorCode.CART_DATA_CORRUPTED);
+      }
+      return cart;
     } catch (JsonProcessingException e) {
-      log.error("장바구니 데이터 저장 실패 - sessionId: {}", sessionId, e);
+      log.error("장바구니 데이터 파싱 실패", e);
+      throw new CustomException(CartErrorCode.CART_DATA_CORRUPTED);
+    }
+  }
+
+  private void saveCartData(String sessionId, CartData cart) {
+    cart.setUpdatedAt(now());
+    try {
+      redisTemplate.opsForValue().set(CART_KEY_PREFIX + sessionId,
+          objectMapper.writeValueAsString(cart), CART_EXPIRE_HOURS, TimeUnit.HOURS);
+    } catch (JsonProcessingException e) {
+      log.error("장바구니 데이터 저장 실패", e);
       throw new CustomException(CartErrorCode.CART_SAVE_FAILED);
     }
+  }
+
+  private CartData emptyCart() {
+    CartData cart = new CartData();
+    cart.setCreatedAt(now());
+    cart.setUpdatedAt(cart.getCreatedAt());
+    return cart;
+  }
+
+  private String now() {
+    return LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
   }
 }
